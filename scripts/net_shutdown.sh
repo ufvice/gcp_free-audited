@@ -60,7 +60,17 @@ systemctl enable --now cron
 
 # 等待服务启动并生成初始数据库
 sleep 5
-vnstat -i "$INTERFACE" > /dev/null 2>&1
+vnstat -i "$INTERFACE" > /dev/null 2>&1 || true
+
+# 记录本次安装时间。全新 vnStat 数据库通常需要数分钟才会产生第一份
+# 月度统计；监控脚本仅在这段有界初始化窗口内接受该特定状态。
+STATE_DIR="/var/lib/gcp-free-audited"
+install -d -o root -g root -m 0700 "$STATE_DIR"
+INIT_EPOCH_TMP=$(mktemp "$STATE_DIR/.monitor-installed-at.XXXXXX")
+date '+%s' > "$INIT_EPOCH_TMP"
+chown root:root "$INIT_EPOCH_TMP"
+chmod 0600 "$INIT_EPOCH_TMP"
+mv -f "$INIT_EPOCH_TMP" "$STATE_DIR/monitor-installed-at"
 
 # 5. 生成本工具专属监控脚本
 echo "--> 生成监控脚本 /root/gcp_free_check_traffic.sh..."
@@ -80,6 +90,8 @@ INTERFACE="$INTERFACE"
 LIMIT=$LIMIT
 LIMIT_BYTES=\$((LIMIT * 1073741824))
 STATE_DIR="/var/lib/gcp-free-audited"
+INIT_EPOCH_FILE="\$STATE_DIR/monitor-installed-at"
+INIT_GRACE_SECONDS=900
 MONTH_KEY=\$(date '+%Y-%m')
 TRIGGER_FILE="\$STATE_DIR/traffic-limit-\$MONTH_KEY.reached"
 
@@ -145,15 +157,42 @@ if [ -f "\$TRIGGER_FILE" ]; then
 fi
 
 # 获取流量数据。vnStat oneline 固定为 15 个字段，第 10 个字段为本月 TX。
-# 开机时 vnstat 可能尚未就绪，先短暂重试，再按失败关闭处理。
+# 全新数据库会暂时返回 "Not enough data available yet."。仅在安装后的
+# 15 分钟有界窗口内接受这一特定状态；其他错误和超时仍按失败关闭处理。
 VNSTAT_RAW=""
+VNSTAT_ERROR=""
 for attempt in 1 2 3; do
-    if VNSTAT_RAW=\$(vnstat -i "\$INTERFACE" --oneline b 2>/dev/null); then
+    if vnstat_output=\$(vnstat -i "\$INTERFACE" --oneline b 2>&1); then
+        VNSTAT_RAW="\$vnstat_output"
         break
     fi
+    VNSTAT_ERROR="\$vnstat_output"
     sleep 10
 done
 if [ -z "\$VNSTAT_RAW" ]; then
+    case "\$VNSTAT_ERROR" in
+        *": Not enough data available yet.")
+            init_epoch=""
+            if [ -r "\$INIT_EPOCH_FILE" ]; then
+                init_epoch=\$(cat "\$INIT_EPOCH_FILE" 2>/dev/null || true)
+            fi
+            case "\$init_epoch" in
+                ''|*[!0-9]*)
+                    stop_for_limit "vnStat 尚无初始数据且初始化时间无效，为避免失控按失败关闭处理"
+                    ;;
+            esac
+            if [ "\${#init_epoch}" -gt 12 ]; then
+                stop_for_limit "vnStat 初始化时间超出有效范围，为避免失控按失败关闭处理"
+            fi
+            now_epoch=\$(date '+%s')
+            if [ "\$now_epoch" -ge "\$init_epoch" ] &&
+               [ \$((now_epoch - init_epoch)) -le "\$INIT_GRACE_SECONDS" ]; then
+                log "vnStat 正在生成首批统计数据；处于安装后 15 分钟初始化窗口，稍后重试。"
+                exit 0
+            fi
+            stop_for_limit "vnStat 在初始化窗口结束后仍无月度数据，为避免失控按失败关闭处理"
+            ;;
+    esac
     stop_for_limit "无法读取 vnStat 月度出站计数，为避免失控按失败关闭处理"
 fi
 TX_BYTES=\$(printf '%s\n' "\$VNSTAT_RAW" | awk -F ';' 'NF == 15 { print \$10 }')

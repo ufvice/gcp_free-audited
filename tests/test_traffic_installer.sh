@@ -33,6 +33,10 @@ EOF
 cat >"$MOCK_BIN/vnstat" <<'EOF'
 #!/usr/bin/env bash
 if [[ " $* " == *" --oneline b "* ]]; then
+  if [[ -n ${MOCK_VNSTAT_NOT_READY:-} ]]; then
+    echo " eth0: Not enough data available yet." >&2
+    exit 1
+  fi
   rx=${MOCK_RX_BYTES:-0}
   tx=${MOCK_TX_BYTES:-1024}
   printf '1;eth0;today;0;0;0;0;month;%s;%s;0;0;%s;%s;0\n' "$rx" "$tx" "$rx" "$tx"
@@ -77,6 +81,24 @@ bash -n /root/gcp_free_check_traffic.sh
 grep -Fq 'LIMIT=100' /root/gcp_free_check_traffic.sh
 grep -Fq '* * * * * /root/gcp_free_check_traffic.sh # gcp-free-audited' /tmp/installed-crontab
 grep -Fq '@reboot /root/gcp_free_check_traffic.sh # gcp-free-audited' /tmp/installed-crontab
+
+# A real fresh vnStat database reports this exact state for several minutes.
+# It must be tolerated only inside the bounded post-install initialization window.
+: >/tmp/mock-systemctl.log
+MOCK_VNSTAT_NOT_READY=1 bash /root/gcp_free_check_traffic.sh
+if grep -Fq 'poweroff' /tmp/mock-systemctl.log; then
+  echo "fresh vnStat initialization incorrectly triggered shutdown" >&2
+  exit 1
+fi
+
+# The same state after the grace window must fail closed.
+printf '%s\n' "$(( $(date '+%s') - 901 ))" >/var/lib/gcp-free-audited/monitor-installed-at
+: >/tmp/mock-systemctl.log
+MOCK_VNSTAT_NOT_READY=1 bash /root/gcp_free_check_traffic.sh
+grep -Fq 'poweroff' /tmp/mock-systemctl.log
+rm -f "/var/lib/gcp-free-audited/traffic-limit-$(date '+%Y-%m').reached"
+date '+%s' >/var/lib/gcp-free-audited/monitor-installed-at
+: >/tmp/mock-systemctl.log
 
 MOCK_RX_BYTES=107374182400 MOCK_TX_BYTES=1024 bash /root/gcp_free_check_traffic.sh
 if grep -Fq 'poweroff' /tmp/mock-systemctl.log; then
