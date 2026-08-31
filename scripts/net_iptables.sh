@@ -16,6 +16,16 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+LIMIT="${GCP_FREE_TRAFFIC_LIMIT_GIB:-100}"
+case "$LIMIT" in
+    ''|*[!0-9]*) echo "错误：流量阈值必须是整数 GiB。"; exit 1 ;;
+esac
+LIMIT=$((10#$LIMIT))
+if [ "$LIMIT" -lt 1 ] || [ "$LIMIT" -gt 199 ]; then
+    echo "错误：流量阈值必须在 1-199 GiB 之间。"
+    exit 1
+fi
+
 # 2. 自动获取默认网卡名称
 INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
 
@@ -62,7 +72,7 @@ export LC_ALL=C
 # 配置
 LOG_FILE="/var/log/traffic_monitor.log"
 INTERFACE="$INTERFACE"
-LIMIT=180
+LIMIT=$LIMIT
 
 # 日志记录函数 (保持原格式)
 log() {
@@ -76,11 +86,11 @@ if [ "\$(id -u)" -ne 0 ]; then
 fi
 
 # 获取流量数据 (强制使用 'b' 参数获取字节单位)
-# vnStat oneline: 第 9 个字段为本月 TX 字节数。
+# vnStat oneline: 第 10 个字段为本月 TX 字节数。
 VNSTAT_RAW=\$(vnstat -i "\$INTERFACE" --oneline b 2>/dev/null)
 
 # 提取本月出站流量 (TX)
-TX_BYTES=\$(echo "\$VNSTAT_RAW" | cut -d ';' -f 9)
+TX_BYTES=\$(echo "\$VNSTAT_RAW" | cut -d ';' -f 10)
 
 # 如果获取失败或为空，默认为 0
 if [[ -z "\$TX_BYTES" ]]; then

@@ -1,6 +1,6 @@
 # GCP Free 工具集（审计加固版）
 
-本仓库是 `fatekey/gcp_free` 的私有历史副本，安全基线固定为上游提交
+本仓库是 `fatekey/gcp_free` 的公开历史副本，安全基线固定为上游提交
 `f09a7316510494c59852a638a6a85af1e3fddc99`。它不会在运行时从上游
 `master` 下载 shell 脚本。
 
@@ -13,8 +13,10 @@
   并在创建实例之前通过“指定来源允许 + 其他来源拒绝”的优先级规则把 SSH 限制到用户输入的 IP/CIDR；
   规则创建失败时不会继续创建实例。
 - 配置防火墙时会识别并删除内容完全匹配上游实现的 `allow-all-ingress-custom`；同名但内容不同的规则不会被误删。
-- 流量限制使用独立 iptables 链，不再清空系统、Docker 或用户已有规则。
-  安装时会精确移除旧版生成的两个无标记 cron 命令，避免旧脚本继续运行。
+- 保留的旧版入站限制只使用独立 iptables 链，不再清空系统、Docker 或用户已有规则；
+  新版关机保护安装时会精确移除旧 cron 和本工具拥有的旧链，避免两套策略同时运行。
+- 菜单中的主网卡出站流量保护默认以 `100 GiB` 为触发阈值（可输入 `1-199`），
+  每分钟及开机时检查；达到后保留计数、记录本月锁定标记并自动关机。
 - `scripts/dae.sh` 固定安装 dae `v1.0.0`，程序与 GeoIP 文件都使用仓库内置的可信 SHA-256 校验；不使用 latest、CDN 或 Worker 镜像。
 - Python 依赖固定在 `requirements.lock`，安装时强制核对包哈希。
 
@@ -31,15 +33,17 @@
 - 刷 AMD CPU
 - 配置防火墙规则
 - 换源、安装 dae、上传 `config.dae`
-- 远程安装流量监控脚本（iptables 监控 / 超额自动关机）
+- 远程安装主网卡出站流量保护（默认 100 GiB，超额自动关机）
 ## 快速开始（推荐）
 
 打开 https://console.cloud.google.com/
 在右上角点击 Cloud Shell 
 在 Cloud Shell 服务器运行
 ```bash
-# 初次运行（私有仓库会要求 GitHub 身份验证）
-git clone https://github.com/ufvice/gcp_free-audited.git && cd gcp_free-audited && bash start.sh
+# 初次运行；固定到已审计标签，不跟随 main 后续变化
+git clone --branch audited-f09a731-v2 --depth 1 https://github.com/ufvice/gcp_free-audited.git
+cd gcp_free-audited
+bash start.sh
 # 再次运行
 cd ~/gcp_free-audited && bash start.sh
 ```
@@ -89,8 +93,26 @@ python gcp.py
 - `config.dae`: dae 配置模板
 - `scripts/apt.sh`: 换源脚本
 - `scripts/dae.sh`: 安装 dae
-- `scripts/net_iptables.sh`: 流量监控（iptables）
-- `scripts/net_shutdown.sh`: 超额自动关机
+- `scripts/net_iptables.sh`: 旧的“限制业务入站”模式；它不是出站账单保护，菜单不再提供
+- `scripts/net_shutdown.sh`: 主网卡出站达到阈值后锁定当月状态并自动关机
+
+## 推荐部署流程（100 GiB 主网卡出站保护）
+
+1. 在 GCP 控制台创建或选择已绑定结算账号的项目，并设置 Cloud Billing Budget 告警。
+   Budget 只是延迟告警，不是消费硬上限。
+2. 打开 Cloud Shell，先执行 `gcloud config set project 你的项目ID`，再按上面的固定标签命令克隆并运行工具。
+3. 选择 `[1] 新建免费实例`，区域选择 Oregon/Iowa/South Carolina 之一，系统推荐 Debian 12。
+4. SSH 来源填写你当前公网 IPv4，例如 `203.0.113.10/32`；不要填写 `0.0.0.0/0`。
+5. 实例创建后选择 `[2] 选择服务器`，再选择 `[8] 安装流量监控脚本`。
+6. 选择“达到阈值后自动关机”，阈值直接回车即为 `100 GiB`。
+7. 不需要 CDN 分流时，不执行 `[6] 安装 dae` 和 `[7] 上传 config.dae`；配置防火墙时也不要启用 CDN IP 拒绝规则。
+8. 登录 VM 后可执行 `sudo vnstat -i "$(ip route | awk '/default/ {print $5; exit}')" -m`
+   查看月度计数；不要把强制检查脚本当作只读命令，它在达到阈值时会立即断网关机。
+
+> 该保护是 VM 内基于 vnStat 的本地触发器，不是 Google Cloud 的账单硬上限。
+> 监控、vnStat 和关机均可能有延迟；root 入侵者也能停用它。请同时保持最小入站端口、
+> 使用预算告警，并将支付方式风险控制在你可以接受的范围内。
+> 当前实现支持本工具创建的单主网卡 GCP 实例；多网卡或默认路由会变化的机器不在支持范围内。
 
 ## 常见问题
 

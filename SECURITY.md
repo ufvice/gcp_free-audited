@@ -1,18 +1,18 @@
 # Security model
 
-This repository is a private, history-preserving duplicate of
+This repository is a public, history-preserving duplicate of
 `fatekey/gcp_free` audited from upstream commit
 `f09a7316510494c59852a638a6a85af1e3fddc99`.
 
 ## Trust boundary
 
-- Runtime root scripts come only from the checked-out private repository and are
+- Runtime root scripts come only from the checked-out audited repository and are
   streamed over SSH with an integrity check. They never follow an upstream branch.
 - dae `v1.0.0`, its three supported x86_64 artifacts, and GeoIP data are pinned by
   version/commit and repository-reviewed SHA-256 values.
 - Python packages are installed from `requirements.lock` with `--require-hashes`.
-- A Git checkout is still executable code. Only run a reviewed commit from this
-  private repository; local modifications intentionally change what will run.
+- A Git checkout is still executable code. Only run a reviewed commit or annotated
+  audited tag; local modifications intentionally change what will run.
 
 ## Update procedure
 
@@ -30,5 +30,9 @@ This repository is a private, history-preserving duplicate of
   version-pinned here so security updates remain available.
 - GCP hierarchical firewall policies or manually created priority-0 rules can override
   project VPC rules; review organization/folder policies separately.
-- The traffic-limiter firewall mode only limits IPv4 host input. It does not claim to
-  meter IPv6 or container-forwarded traffic.
+- The menu-provided traffic protection is a guest-local vnStat trigger, not a Cloud
+  Billing hard cap. Monitoring and shutdown can lag, and an attacker with root can
+  disable it. Its default trigger is 100 GiB of monthly TX on the detected primary
+  interface and it powers the VM off. Multi-interface VMs are outside its scope.
+- The retained legacy `net_iptables.sh` only limits IPv4 host input. It is not exposed
+  by the menu and must not be treated as outbound billing protection.

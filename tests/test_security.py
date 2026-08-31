@@ -10,6 +10,13 @@ import gcp
 
 
 class SecurityHardeningTests(unittest.TestCase):
+    def test_traffic_limit_accepts_only_safe_free_tier_range(self):
+        self.assertEqual(gcp.normalize_traffic_limit_gib("100"), 100)
+        self.assertEqual(gcp.normalize_traffic_limit_gib(199), 199)
+        self.assertIsNone(gcp.normalize_traffic_limit_gib("0"))
+        self.assertIsNone(gcp.normalize_traffic_limit_gib("200"))
+        self.assertIsNone(gcp.normalize_traffic_limit_gib("100; id"))
+
     def test_source_cidr_accepts_only_ipv4_and_normalizes_hosts(self):
         self.assertEqual(gcp.normalize_source_cidr("203.0.113.10"), "203.0.113.10/32")
         self.assertEqual(gcp.normalize_source_cidr("203.0.113.10/24"), "203.0.113.0/24")
@@ -84,6 +91,44 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertIn("mktemp /root/", remote_command)
         self.assertNotIn("raw.githubusercontent.com", remote_command)
         self.assertNotIn("curl", remote_command)
+
+    def test_traffic_limit_is_passed_as_validated_environment(self):
+        calls = []
+
+        def fake_run(command, input=None):
+            calls.append((command, input))
+            return types.SimpleNamespace(returncode=0)
+
+        instance = {
+            "name": "vm",
+            "zone": "us-west1-b",
+            "external_ip": "203.0.113.20",
+        }
+        remote = {"method": "ssh", "user": "tester", "port": "22", "key": ""}
+        with mock.patch.object(gcp.subprocess, "run", side_effect=fake_run):
+            self.assertTrue(
+                gcp.run_remote_script(
+                    "example-project",
+                    instance,
+                    "net_shutdown",
+                    remote,
+                    traffic_limit_gib=100,
+                )
+            )
+
+        self.assertIn("env GCP_FREE_TRAFFIC_LIMIT_GIB=100", calls[0][0][-1])
+
+        with mock.patch.object(gcp.subprocess, "run") as run_mock:
+            self.assertFalse(
+                gcp.run_remote_script(
+                    "example-project",
+                    instance,
+                    "net_shutdown",
+                    remote,
+                    traffic_limit_gib="100; id",
+                )
+            )
+            run_mock.assert_not_called()
 
     def test_insert_firewall_rule_propagates_operation_error(self):
         firewall_client = mock.Mock()

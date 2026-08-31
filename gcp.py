@@ -26,6 +26,8 @@ LOCAL_SCRIPT_PATHS = {
     "net_shutdown": "scripts/net_shutdown.sh",
 }
 MANAGED_NETWORK_TAG_PREFIX = "gcp-free-"
+DEFAULT_TRAFFIC_LIMIT_GIB = 100
+MAX_TRAFFIC_LIMIT_GIB = 199
 
 REGION_OPTIONS = [
     {"name": "俄勒冈 (Oregon) [推荐]", "region": "us-west1", "default_zone": "us-west1-b"},
@@ -773,7 +775,23 @@ def build_remote_exec_command(project_id, instance_info, remote_config, remote_c
     return None
 
 
-def run_remote_script(project_id, instance_info, script_key, remote_config):
+def normalize_traffic_limit_gib(value):
+    text = str(value).strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", text):
+        return None
+    limit = int(text)
+    if limit > MAX_TRAFFIC_LIMIT_GIB:
+        return None
+    return limit
+
+
+def run_remote_script(
+    project_id,
+    instance_info,
+    script_key,
+    remote_config,
+    traffic_limit_gib=None,
+):
     relative_path = LOCAL_SCRIPT_PATHS.get(script_key)
     if not relative_path:
         print_warning("未知的脚本类型，无法执行。")
@@ -787,8 +805,18 @@ def run_remote_script(project_id, instance_info, script_key, remote_config):
     with open(local_path, "rb") as script_file:
         script_bytes = script_file.read()
     expected_sha256 = hashlib.sha256(script_bytes).hexdigest()
+    environment = ""
+    if traffic_limit_gib is not None:
+        normalized_limit = normalize_traffic_limit_gib(traffic_limit_gib)
+        if normalized_limit is None:
+            print_warning(
+                f"流量阈值必须是 1-{MAX_TRAFFIC_LIMIT_GIB} 之间的整数 GiB。"
+            )
+            return False
+        environment = f"env GCP_FREE_TRAFFIC_LIMIT_GIB={normalized_limit} "
+
     remote_command = (
-        "sudo -- bash -c 'set -eu; umask 077; "
+        f"sudo -- {environment}bash -c 'set -eu; umask 077; "
         "tmp=$(mktemp /root/gcp-free-script.XXXXXX); "
         "trap \"rm -f $tmp\" EXIT; cat >\"$tmp\"; "
         "actual=$(sha256sum \"$tmp\" | cut -d \" \" -f 1); "
@@ -814,16 +842,25 @@ def run_remote_script(project_id, instance_info, script_key, remote_config):
 
 
 def select_traffic_monitor_script():
-    print("\n--- 请选择流量监控脚本 ---")
-    print("[1] 安装 超额关闭 ssh 之外其他入站 (net_iptables.sh)")
-    print("[2] 安装 超额自动关机 (net_shutdown.sh)")
+    print("\n--- 安装主网卡出站流量保护 ---")
+    print("[1] 达到阈值后自动关机（推荐）")
     print("[0] 返回")
     while True:
         choice = input("请输入数字选择: ").strip()
         if choice == "1":
-            return "net_iptables"
-        if choice == "2":
-            return "net_shutdown"
+            while True:
+                raw_limit = input(
+                    f"请输入每月触发阈值 GiB（直接回车默认 {DEFAULT_TRAFFIC_LIMIT_GIB}，"
+                    f"范围 1-{MAX_TRAFFIC_LIMIT_GIB}）: "
+                ).strip()
+                if not raw_limit:
+                    return "net_shutdown", DEFAULT_TRAFFIC_LIMIT_GIB
+                limit = normalize_traffic_limit_gib(raw_limit)
+                if limit is not None:
+                    return "net_shutdown", limit
+                print(
+                    f"输入无效：请输入 1-{MAX_TRAFFIC_LIMIT_GIB} 之间的整数。"
+                )
         if choice == "0":
             return None
         print("输入无效，请重试。")
@@ -960,12 +997,19 @@ def main():
             if not current_instance:
                 current_instance = select_instance(project_id)
             if current_instance:
-                script_key = select_traffic_monitor_script()
-                if script_key:
+                traffic_selection = select_traffic_monitor_script()
+                if traffic_selection:
+                    script_key, traffic_limit_gib = traffic_selection
                     if not remote_config:
                         remote_config = pick_remote_method()
                     if remote_config:
-                        run_remote_script(project_id, current_instance, script_key, remote_config)
+                        run_remote_script(
+                            project_id,
+                            current_instance,
+                            script_key,
+                            remote_config,
+                            traffic_limit_gib=traffic_limit_gib,
+                        )
         elif choice == "9":
             if not current_instance:
                 current_instance = select_instance(project_id)
