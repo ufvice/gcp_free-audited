@@ -30,6 +30,10 @@ This repository is a public, history-preserving duplicate of
   version-pinned here so security updates remain available.
 - GCP hierarchical firewall policies or manually created priority-0 rules can override
   project VPC rules; review organization/folder policies separately.
+- The recommended SSH path allows only Google's IAP TCP forwarding range
+  `35.235.240.0/20` and uses `gcloud compute ssh --tunnel-through-iap`. Access still
+  depends on correct Google IAM policy. Custom mode accepts multiple IPv4 CIDRs but
+  deliberately rejects `0.0.0.0/0`.
 - The menu-provided traffic protection is a guest-local vnStat trigger, not a Cloud
   Billing hard cap. Monitoring and shutdown can lag, and an attacker with root can
   disable it. Its default trigger is 100 GiB of monthly TX on the detected primary

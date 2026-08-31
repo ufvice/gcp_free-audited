@@ -10,7 +10,8 @@
 - `config.dae` 默认严格校验 TLS 证书（`allow_insecure: false`）。
 - 删除“向整个 VPC 开放所有入站端口”的功能。
 - 新实例不再附加公开 HTTP/HTTPS 标签；防火墙使用实例专属标签和规则名，
-  并在创建实例之前通过“指定来源允许 + 其他来源拒绝”的优先级规则把 SSH 限制到用户输入的 IP/CIDR；
+  并在创建实例之前通过“指定来源允许 + 其他来源拒绝”的优先级规则限制 SSH；
+  默认仅允许 Google IAP TCP 转发网段，也支持逗号分隔的多个自定义 IPv4/CIDR；
   规则创建失败时不会继续创建实例。
 - 配置防火墙时会识别并删除内容完全匹配上游实现的 `allow-all-ingress-custom`；同名但内容不同的规则不会被误删。
 - 保留的旧版入站限制只使用独立 iptables 链，不再清空系统、Docker 或用户已有规则；
@@ -41,7 +42,7 @@
 在 Cloud Shell 服务器运行
 ```bash
 # 初次运行；固定到已审计标签，不跟随 main 后续变化
-git clone --branch audited-f09a731-v2 --depth 1 https://github.com/ufvice/gcp_free-audited.git
+git clone --branch audited-f09a731-v3 --depth 1 https://github.com/ufvice/gcp_free-audited.git
 cd gcp_free-audited
 bash start.sh
 # 再次运行
@@ -102,12 +103,22 @@ python gcp.py
    Budget 只是延迟告警，不是消费硬上限。
 2. 打开 Cloud Shell，先执行 `gcloud config set project 你的项目ID`，再按上面的固定标签命令克隆并运行工具。
 3. 选择 `[1] 新建免费实例`，区域选择 Oregon/Iowa/South Carolina 之一，系统推荐 Debian 12。
-4. SSH 来源填写你当前公网 IPv4，例如 `203.0.113.10/32`；不要填写 `0.0.0.0/0`。
+4. SSH 接入选择 `[1] Google IAP`。工具会启用 IAP API、只放行 Google IAP TCP
+   转发网段 `35.235.240.0/20`，并让后续 `gcloud compute ssh` 自动使用
+   `--tunnel-through-iap`；Cloud Shell 和 PC 无需分别维护公网 IP。
 5. 实例创建后选择 `[2] 选择服务器`，再选择 `[8] 安装流量监控脚本`。
 6. 选择“达到阈值后自动关机”，阈值直接回车即为 `100 GiB`。
 7. 不需要 CDN 分流时，不执行 `[6] 安装 dae` 和 `[7] 上传 config.dae`；配置防火墙时也不要启用 CDN IP 拒绝规则。
 8. 登录 VM 后可执行 `sudo vnstat -i "$(ip route | awk '/default/ {print $5; exit}')" -m`
    查看月度计数；不要把强制检查脚本当作只读命令，它在达到阈值时会立即断网关机。
+
+如果不能使用 IAP，可选择“自定义一个或多个 IPv4/CIDR”，例如：
+
+```text
+34.81.192.51/32,203.0.113.8/32,198.51.100.0/24
+```
+
+工具会逐项规范化、去重，并拒绝 IPv6、无效输入和 `0.0.0.0/0`。
 
 > 该保护是 VM 内基于 vnStat 的本地触发器，不是 Google Cloud 的账单硬上限。
 > 监控、vnStat 和关机均可能有延迟；root 入侵者也能停用它。请同时保持最小入站端口、

@@ -24,6 +24,16 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertIsNone(gcp.normalize_source_cidr("::/0"))
         self.assertIsNone(gcp.normalize_source_cidr("not-an-ip"))
 
+    def test_multiple_source_cidrs_are_normalized_and_deduplicated(self):
+        self.assertEqual(
+            gcp.normalize_source_cidrs(
+                "203.0.113.10, 198.51.100.8/24;203.0.113.10/32"
+            ),
+            ["203.0.113.10/32", "198.51.100.0/24"],
+        )
+        self.assertIsNone(gcp.normalize_source_cidrs("203.0.113.10,0.0.0.0/0"))
+        self.assertIsNone(gcp.normalize_source_cidrs("203.0.113.10,::1"))
+
     def test_long_instance_names_get_distinct_tags(self):
         prefix = "a" * 60
         first = gcp.managed_network_tag(prefix + "-one")
@@ -43,7 +53,9 @@ class SecurityHardeningTests(unittest.TestCase):
         ):
             self.assertTrue(
                 gcp.add_restricted_ssh_ingress(
-                    "example-project", instance, "203.0.113.10/32"
+                    "example-project",
+                    instance,
+                    ["203.0.113.10/32", "198.51.100.0/24"],
                 )
             )
 
@@ -51,7 +63,10 @@ class SecurityHardeningTests(unittest.TestCase):
         deny_rule, allow_rule = inserted
         expected_tag = gcp.managed_network_tag("vm-one")
         self.assertEqual(allow_rule.target_tags, [expected_tag])
-        self.assertEqual(allow_rule.source_ranges, ["203.0.113.10/32"])
+        self.assertEqual(
+            allow_rule.source_ranges,
+            ["203.0.113.10/32", "198.51.100.0/24"],
+        )
         self.assertEqual(allow_rule.allowed[0].I_p_protocol, "tcp")
         self.assertEqual(allow_rule.allowed[0].ports, ["22"])
         self.assertEqual(deny_rule.target_tags, [expected_tag])
@@ -91,6 +106,24 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertIn("mktemp /root/", remote_command)
         self.assertNotIn("raw.githubusercontent.com", remote_command)
         self.assertNotIn("curl", remote_command)
+
+    def test_gcloud_iap_remote_command_uses_tunnel(self):
+        instance = {"name": "vm", "zone": "us-west1-b"}
+        command = gcp.build_remote_exec_command(
+            "example-project",
+            instance,
+            {"method": "gcloud", "use_iap": True},
+            "true",
+        )
+        self.assertIn("--tunnel-through-iap", command)
+
+        direct_command = gcp.build_remote_exec_command(
+            "example-project",
+            instance,
+            {"method": "gcloud", "use_iap": False},
+            "true",
+        )
+        self.assertNotIn("--tunnel-through-iap", direct_command)
 
     def test_traffic_limit_is_passed_as_validated_environment(self):
         calls = []

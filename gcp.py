@@ -26,6 +26,8 @@ LOCAL_SCRIPT_PATHS = {
     "net_shutdown": "scripts/net_shutdown.sh",
 }
 MANAGED_NETWORK_TAG_PREFIX = "gcp-free-"
+IAP_TCP_FORWARDING_CIDR = "35.235.240.0/20"
+MAX_SSH_SOURCE_RANGES = 256
 DEFAULT_TRAFFIC_LIMIT_GIB = 100
 MAX_TRAFFIC_LIMIT_GIB = 199
 
@@ -410,6 +412,73 @@ def normalize_source_cidr(value):
         return None
 
 
+def normalize_source_cidrs(value):
+    parts = [part for part in re.split(r"[\s,;]+", str(value).strip()) if part]
+    if not parts or len(parts) > MAX_SSH_SOURCE_RANGES:
+        return None
+
+    normalized = []
+    for part in parts:
+        cidr = normalize_source_cidr(part)
+        if cidr is None:
+            return None
+        if cidr not in normalized:
+            normalized.append(cidr)
+    return normalized
+
+
+def enable_iap_api(project_id):
+    if shutil.which("gcloud") is None:
+        print_warning("未找到 gcloud，无法启用 IAP API。")
+        return False
+    print_info("正在确认 Identity-Aware Proxy API 已启用...")
+    result = subprocess.run(
+        [
+            "gcloud",
+            "services",
+            "enable",
+            "iap.googleapis.com",
+            "--project",
+            project_id,
+            "--quiet",
+        ]
+    )
+    if result.returncode != 0:
+        print_warning("IAP API 启用失败。请检查项目权限和结算状态。")
+        return False
+    return True
+
+
+def select_ssh_access(project_id):
+    while True:
+        print("\n--- SSH 接入方式 ---")
+        print("[1] Google IAP（推荐；无需维护 Cloud Shell/PC 公网 IP）")
+        print("[2] 自定义一个或多个 IPv4/CIDR")
+        print("[0] 取消")
+        choice = input("请输入数字选择（默认 1）: ").strip() or "1"
+
+        if choice == "1":
+            if enable_iap_api(project_id):
+                return [IAP_TCP_FORWARDING_CIDR], {"method": "gcloud", "use_iap": True}
+            return None
+        if choice == "2":
+            while True:
+                source = input(
+                    "请输入来源 IPv4/CIDR，多个用逗号分隔"
+                    "（例如 203.0.113.10/32,198.51.100.0/24）: "
+                ).strip()
+                source_ranges = normalize_source_cidrs(source)
+                if source_ranges:
+                    return source_ranges, None
+                print(
+                    f"输入无效：仅接受 1-{MAX_SSH_SOURCE_RANGES} 个非全开放 IPv4/CIDR，"
+                    "不接受 0.0.0.0/0。"
+                )
+        if choice == "0":
+            return None
+        print("输入无效，请重试。")
+
+
 def insert_firewall_rule(project_id, firewall_rule):
     firewall_client = compute_v1.FirewallsClient()
     try:
@@ -463,7 +532,7 @@ def upsert_firewall_rule(project_id, firewall_rule):
         return False
 
 
-def add_restricted_ssh_ingress(project_id, instance_info, source_cidr):
+def add_restricted_ssh_ingress(project_id, instance_info, source_ranges):
     network = instance_info.get("network") or "global/networks/default"
     target_tag = managed_network_tag(instance_info["name"])
     rule_names = instance_firewall_rule_names(instance_info)
@@ -472,7 +541,7 @@ def add_restricted_ssh_ingress(project_id, instance_info, source_cidr):
     allow_rule.direction = "INGRESS"
     allow_rule.network = network
     allow_rule.priority = 100
-    allow_rule.source_ranges = [source_cidr]
+    allow_rule.source_ranges = list(source_ranges)
     allow_rule.target_tags = [target_tag]
     allow_config = compute_v1.Allowed()
     set_protocol_field(allow_config, "tcp")
@@ -491,7 +560,7 @@ def add_restricted_ssh_ingress(project_id, instance_info, source_cidr):
     deny_config.ports = ["22"]
     deny_rule.denied = [deny_config]
 
-    print(f"\n正在将标签 {target_tag} 的 SSH 限制为 {source_cidr} ...")
+    print(f"\n正在将标签 {target_tag} 的 SSH 限制为: {', '.join(source_ranges)} ...")
     # Install/update deny first. Existing protection remains active while an
     # allow source is changed; a failed update therefore fails closed.
     if not upsert_firewall_rule(project_id, deny_rule):
@@ -541,26 +610,26 @@ def configure_firewall(project_id, instance_info):
     target_tag = managed_network_tag(instance_info["name"])
     if not remove_legacy_allow_all_rule(project_id, network):
         print_warning("无法确认旧的全开放规则已移除，已停止防火墙配置。")
-        return False
+        return False, None
 
     if target_tag not in instance_info.get("tags", []):
         print_warning(
             f"当前实例没有安全作用域标签 {target_tag}，不会创建可能影响其他实例的入站规则。"
         )
         print_warning("请为实例添加该网络标签后重新选择实例，或使用本工具新建实例。")
-        return False
+        return False, None
     else:
-        choice_in = input("\n[1/2] 是否将 SSH 仅开放给你的 IP/CIDR? (Y/n): ").strip().lower()
+        suggested_remote = None
+        choice_in = input("\n[1/2] 是否配置受限 SSH 接入? (Y/n): ").strip().lower()
         if choice_in in ("", "y", "yes"):
-            while True:
-                source = input("请输入来源 IP/CIDR（例如 203.0.113.10/32）: ").strip()
-                source_cidr = normalize_source_cidr(source)
-                if source_cidr:
-                    if not add_restricted_ssh_ingress(project_id, instance_info, source_cidr):
-                        print_warning("SSH 限制配置失败。")
-                        return False
-                    break
-                print("输入不是有效的 IPv4 CIDR，请重试。")
+            ssh_access = select_ssh_access(project_id)
+            if not ssh_access:
+                print_warning("已取消 SSH 接入配置。")
+                return False, None
+            source_ranges, suggested_remote = ssh_access
+            if not add_restricted_ssh_ingress(project_id, instance_info, source_ranges):
+                print_warning("SSH 限制配置失败。")
+                return False, None
         else:
             print("已跳过 SSH 入站规则配置。")
 
@@ -575,12 +644,12 @@ def configure_firewall(project_id, instance_info):
 
             if not add_deny_cdn_egress(project_id, ips, instance_info):
                 print_warning("出站拒绝规则配置失败。")
-                return False
+                return False, None
     else:
         print("已跳过出站规则配置。")
 
     print("\n所有操作完成。")
-    return True
+    return True, suggested_remote
 
 
 def is_not_found_error(exc):
@@ -723,9 +792,19 @@ def pick_remote_method():
         return None
 
     if has_gcloud:
-        choice = input("是否使用 gcloud compute ssh 远程执行? (Y/n): ").strip().lower()
-        if choice in ("", "y", "yes"):
-            return {"method": "gcloud"}
+        print("\n--- 远程执行方式 ---")
+        print("[1] gcloud 经 Google IAP 连接（推荐）")
+        print("[2] gcloud 直连实例公网 IP")
+        if has_ssh:
+            print("[3] 系统 ssh 直连")
+        choice = input("请输入数字选择（默认 1）: ").strip() or "1"
+        if choice == "1":
+            return {"method": "gcloud", "use_iap": True}
+        if choice == "2":
+            return {"method": "gcloud", "use_iap": False}
+        if choice != "3":
+            print_warning("远程执行方式输入无效。")
+            return None
 
     if not has_ssh:
         print_warning("未找到 ssh 命令，无法继续。")
@@ -744,7 +823,7 @@ def build_remote_exec_command(project_id, instance_info, remote_config, remote_c
     method = remote_config.get("method")
 
     if method == "gcloud":
-        return [
+        cmd = [
             "gcloud",
             "compute",
             "ssh",
@@ -753,9 +832,11 @@ def build_remote_exec_command(project_id, instance_info, remote_config, remote_c
             project_id,
             "--zone",
             zone,
-            "--command",
-            remote_command,
         ]
+        if remote_config.get("use_iap"):
+            cmd.append("--tunnel-through-iap")
+        cmd += ["--command", remote_command]
+        return cmd
     if method == "ssh":
         host = instance_info.get("external_ip")
         if not host or host == "-":
@@ -935,12 +1016,11 @@ def main():
         if choice == "1":
             zone = select_zone(project_id)
             os_config = select_os_image()
-            while True:
-                source = input("请输入允许 SSH 的来源 IP/CIDR（例如 203.0.113.10/32）: ").strip()
-                source_cidr = normalize_source_cidr(source)
-                if source_cidr:
-                    break
-                print("输入不是有效的 IPv4 CIDR，请重试。")
+            ssh_access = select_ssh_access(project_id)
+            if not ssh_access:
+                print_warning("未配置 SSH 接入，实例未创建。")
+                continue
+            source_ranges, suggested_remote = ssh_access
 
             pending_instance = {
                 "name": "free-tier-vm",
@@ -949,10 +1029,13 @@ def main():
             if not remove_legacy_allow_all_rule(project_id, pending_instance["network"]):
                 print_warning("无法确认旧的全开放规则已移除，实例未创建。")
                 continue
-            if not add_restricted_ssh_ingress(project_id, pending_instance, source_cidr):
+            if not add_restricted_ssh_ingress(project_id, pending_instance, source_ranges):
                 print_warning("无法预先建立 SSH 限制规则，实例未创建。")
                 continue
-            if not create_instance(project_id, zone, os_config):
+            if create_instance(project_id, zone, os_config):
+                if suggested_remote:
+                    remote_config = suggested_remote
+            else:
                 print_warning(
                     "实例创建未确认成功；为避免误删已存在或仍在创建实例的保护，"
                     "预建防火墙规则会保留。请到控制台确认实例状态。"
@@ -968,7 +1051,9 @@ def main():
             if not current_instance:
                 current_instance = select_instance(project_id)
             if current_instance:
-                configure_firewall(project_id, current_instance)
+                configured, suggested_remote = configure_firewall(project_id, current_instance)
+                if configured and suggested_remote:
+                    remote_config = suggested_remote
         elif choice == "5":
             if not current_instance:
                 current_instance = select_instance(project_id)
