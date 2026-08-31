@@ -37,7 +37,7 @@ if [[ ! -f "$INIT_MARKER" ]]; then
 
   # shellcheck disable=SC1091
   source "$VENV_DIR/bin/activate"
-  python -m pip install google-cloud-compute google-cloud-resource-manager
+  python -m pip install --require-hashes -r requirements.lock
 
   touch "$INIT_MARKER"
 else

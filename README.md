@@ -1,4 +1,25 @@
-# GCP Free 工具集
+# GCP Free 工具集（审计加固版）
+
+本仓库是 `fatekey/gcp_free` 的私有历史副本，安全基线固定为上游提交
+`f09a7316510494c59852a638a6a85af1e3fddc99`。它不会在运行时从上游
+`master` 下载 shell 脚本。
+
+## 安全加固
+
+- 远程操作只把当前 checkout 中的 `scripts/*.sh` 通过 SSH 标准输入送入 root 私有临时文件，核对 SHA-256 后执行；不留下普通用户可替换的 `/tmp` 脚本。
+- `config.dae` 默认严格校验 TLS 证书（`allow_insecure: false`）。
+- 删除“向整个 VPC 开放所有入站端口”的功能。
+- 新实例不再附加公开 HTTP/HTTPS 标签；防火墙使用实例专属标签和规则名，
+  并在创建实例之前通过“指定来源允许 + 其他来源拒绝”的优先级规则把 SSH 限制到用户输入的 IP/CIDR；
+  规则创建失败时不会继续创建实例。
+- 配置防火墙时会识别并删除内容完全匹配上游实现的 `allow-all-ingress-custom`；同名但内容不同的规则不会被误删。
+- 流量限制使用独立 iptables 链，不再清空系统、Docker 或用户已有规则。
+  安装时会精确移除旧版生成的两个无标记 cron 命令，避免旧脚本继续运行。
+- `scripts/dae.sh` 固定安装 dae `v1.0.0`，程序与 GeoIP 文件都使用仓库内置的可信 SHA-256 校验；不使用 latest、CDN 或 Worker 镜像。
+- Python 依赖固定在 `requirements.lock`，安装时强制核对包哈希。
+
+> 注意：依赖固定并不等于永久安全。更新任何脚本、dae 版本、GeoIP 或 Python 依赖前，
+> 都应重新审计并通过正常 commit 合入；不要恢复跟随分支或 latest 的运行时下载。
 
 这是一个用于管理 GCP 免费实例的脚本集合，提供创建实例、刷 AMD CPU、配置防火墙、换源、安装 dae，以及远程安装流量监控脚本等功能。
 
@@ -17,10 +38,10 @@
 在右上角点击 Cloud Shell 
 在 Cloud Shell 服务器运行
 ```bash
-# 初次运行
-git clone https://github.com/fatekey/gcp_free && cd gcp_free && bash start.sh
+# 初次运行（私有仓库会要求 GitHub 身份验证）
+git clone https://github.com/ufvice/gcp_free-audited.git && cd gcp_free-audited && bash start.sh
 # 再次运行
-cd ~/gcp_free && bash start.sh
+cd ~/gcp_free-audited && bash start.sh
 ```
 
 ## 环境要求
@@ -58,7 +79,7 @@ bash start.sh
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install google-cloud-compute google-cloud-resource-manager
+pip install --require-hashes -r requirements.lock
 python gcp.py
 ```
 

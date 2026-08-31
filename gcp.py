@@ -1,5 +1,8 @@
 import getpass
+import hashlib
+import ipaddress
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,23 +15,17 @@ try:
 except ImportError:
     print("【错误】缺少必要的 Python 库。")
     print("请先在终端运行以下命令安装：")
-    print("pip install google-cloud-compute google-cloud-resource-manager")
+    print("python -m pip install --require-hashes -r requirements.lock")
     sys.exit(1)
 
-GITHUB_REPO = "fatekey/gcp_free"
-GITHUB_BRANCH = "master"
-GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}"
-GITHUB_RAW_SCRIPTS_BASE = f"{GITHUB_RAW_BASE}/scripts"
-REMOTE_SCRIPT_URLS = {
-    "apt": f"{GITHUB_RAW_SCRIPTS_BASE}/apt.sh",
-    "dae": f"{GITHUB_RAW_SCRIPTS_BASE}/dae.sh",
-    "net_iptables": f"{GITHUB_RAW_SCRIPTS_BASE}/net_iptables.sh",
-    "net_shutdown": f"{GITHUB_RAW_SCRIPTS_BASE}/net_shutdown.sh",
+AUDITED_UPSTREAM_COMMIT = "f09a7316510494c59852a638a6a85af1e3fddc99"
+LOCAL_SCRIPT_PATHS = {
+    "apt": "scripts/apt.sh",
+    "dae": "scripts/dae.sh",
+    "net_iptables": "scripts/net_iptables.sh",
+    "net_shutdown": "scripts/net_shutdown.sh",
 }
-FIREWALL_RULES_TO_CLEAN = [
-    "allow-all-ingress-custom",
-    "deny-cdn-egress-custom",
-]
+MANAGED_NETWORK_TAG_PREFIX = "gcp-free-"
 
 REGION_OPTIONS = [
     {"name": "俄勒冈 (Oregon) [推荐]", "region": "us-west1", "default_zone": "us-west1-b"},
@@ -187,7 +184,9 @@ def create_instance(project_id, zone, os_config, instance_name="free-tier-vm"):
         instance.network_interfaces = [network_interface]
 
         tags = compute_v1.Tags()
-        tags.items = ["http-server", "https-server"]
+        # Do not opt into the default VPC's public HTTP/HTTPS rules.  This
+        # dedicated tag scopes firewall rules created by this tool.
+        tags.items = [managed_network_tag(instance_name)]
         instance.tags = tags
 
         print("配置组装完成，正在向 Google Cloud 发送创建请求...")
@@ -207,6 +206,7 @@ def create_instance(project_id, zone, os_config, instance_name="free-tier-vm"):
 
         if operation.error:
             print("创建失败:", operation.error)
+            return False
         else:
             print_success(f"实例 '{instance_name}' 已创建！")
             try:
@@ -216,10 +216,12 @@ def create_instance(project_id, zone, os_config, instance_name="free-tier-vm"):
             except Exception:
                 pass
             print("请前往 GCP 控制台查看详情。")
+            return True
 
     except Exception as e:
         print(f"\n[失败] 操作中止: {e}")
         traceback.print_exc()
+        return False
 
 
 def list_instances(project_id):
@@ -252,6 +254,7 @@ def list_instances(project_id):
                     "network": network or "global/networks/default",
                     "internal_ip": internal_ip,
                     "external_ip": external_ip,
+                    "tags": list(instance.tags.items) if instance.tags and instance.tags.items else [],
                 }
             )
     return instances
@@ -284,7 +287,10 @@ def select_instance(project_id):
 
 def wait_for_operation(project_id, zone, operation_name):
     operation_client = compute_v1.ZoneOperationsClient()
-    return operation_client.wait(project=project_id, zone=zone, operation=operation_name)
+    completed = operation_client.wait(project=project_id, zone=zone, operation=operation_name)
+    if getattr(completed, "error", None):
+        raise RuntimeError(f"GCP zonal operation failed: {completed.error}")
+    return completed
 
 
 def reroll_cpu_loop(project_id, instance_info):
@@ -365,54 +371,143 @@ def read_cdn_ips(filename="cdnip.txt"):
 
 def set_protocol_field(config_object, value):
     try:
-        config_object.ip_protocol = value
-    except AttributeError:
+        # This unusual spelling is the official google-cloud-compute field.
+        config_object.I_p_protocol = value
+    except (AttributeError, ValueError):
         try:
-            config_object.I_p_protocol = value
-        except AttributeError:
+            config_object.ip_protocol = value
+        except (AttributeError, ValueError):
             print(f"\n【调试信息】无法设置协议字段。对象 '{type(config_object).__name__}' 的有效属性如下:")
             print([d for d in dir(config_object) if not d.startswith("_")])
             raise
 
 
-def add_allow_all_ingress(project_id, network):
+def managed_network_tag(instance_name):
+    safe_name = re.sub(r"[^a-z0-9-]", "-", instance_name.lower()).strip("-")
+    suffix = hashlib.sha256(instance_name.encode("utf-8")).hexdigest()[:10]
+    prefix_budget = 63 - len(MANAGED_NETWORK_TAG_PREFIX) - len(suffix) - 1
+    safe_name = safe_name[:prefix_budget].rstrip("-") or "vm"
+    return f"{MANAGED_NETWORK_TAG_PREFIX}{safe_name}-{suffix}"
+
+
+def instance_firewall_rule_names(instance_info):
+    identity = f"{instance_info.get('network', '')}/{instance_info['name']}"
+    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
+    return {
+        "ssh_allow": f"gcp-free-ssh-{suffix}-allow",
+        "ssh_deny": f"gcp-free-ssh-{suffix}-deny",
+        "cdn_deny": f"gcp-free-cdn-{suffix}-deny",
+    }
+
+
+def normalize_source_cidr(value):
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+        return str(network) if network.version == 4 and network.prefixlen > 0 else None
+    except ValueError:
+        return None
+
+
+def insert_firewall_rule(project_id, firewall_rule):
     firewall_client = compute_v1.FirewallsClient()
-    rule_name = "allow-all-ingress-custom"
-
-    print(f"\n正在创建入站规则: {rule_name} ...")
-
-    firewall_rule = compute_v1.Firewall()
-    firewall_rule.name = rule_name
-    firewall_rule.direction = "INGRESS"
-    firewall_rule.network = network
-    firewall_rule.priority = 1000
-    firewall_rule.source_ranges = ["0.0.0.0/0"]
-
-    allow_config = compute_v1.Allowed()
-    set_protocol_field(allow_config, "all")
-    firewall_rule.allowed = [allow_config]
-
     try:
         operation = firewall_client.insert(project=project_id, firewall_resource=firewall_rule)
         print("正在应用规则...")
         operation_client = compute_v1.GlobalOperationsClient()
-        operation_client.wait(project=project_id, operation=operation.name)
-        print_success("已添加允许所有入站连接的规则。")
+        completed = operation_client.wait(project=project_id, operation=operation.name)
+        if getattr(completed, "error", None):
+            print_warning(f"防火墙规则操作失败: {completed.error}")
+            return False
+        print_success(f"已添加防火墙规则: {firewall_rule.name}")
+        return True
     except Exception as e:
         if "already exists" in str(e):
-            print_warning(f"规则 {rule_name} 已存在。")
+            print_warning(f"规则 {firewall_rule.name} 已存在，拒绝把未知旧配置当作成功。")
+            return False
         else:
             print(f"【失败】{e}")
             traceback.print_exc()
+            return False
 
 
-def add_deny_cdn_egress(project_id, ip_ranges, network):
+def upsert_firewall_rule(project_id, firewall_rule):
+    """Atomically patch an existing managed rule, or insert it when absent."""
+    firewall_client = compute_v1.FirewallsClient()
+    try:
+        firewall_client.get(project=project_id, firewall=firewall_rule.name)
+    except Exception as e:
+        if is_not_found_error(e):
+            return insert_firewall_rule(project_id, firewall_rule)
+        print_warning(f"无法检查防火墙规则 {firewall_rule.name}: {e}")
+        return False
+
+    try:
+        operation = firewall_client.patch(
+            project=project_id,
+            firewall=firewall_rule.name,
+            firewall_resource=firewall_rule,
+        )
+        completed = compute_v1.GlobalOperationsClient().wait(
+            project=project_id,
+            operation=operation.name,
+        )
+        if getattr(completed, "error", None):
+            print_warning(f"更新防火墙规则失败: {completed.error}")
+            return False
+        print_success(f"已更新防火墙规则: {firewall_rule.name}")
+        return True
+    except Exception as e:
+        print_warning(f"更新防火墙规则失败: {firewall_rule.name} ({e})")
+        return False
+
+
+def add_restricted_ssh_ingress(project_id, instance_info, source_cidr):
+    network = instance_info.get("network") or "global/networks/default"
+    target_tag = managed_network_tag(instance_info["name"])
+    rule_names = instance_firewall_rule_names(instance_info)
+    allow_rule = compute_v1.Firewall()
+    allow_rule.name = rule_names["ssh_allow"]
+    allow_rule.direction = "INGRESS"
+    allow_rule.network = network
+    allow_rule.priority = 100
+    allow_rule.source_ranges = [source_cidr]
+    allow_rule.target_tags = [target_tag]
+    allow_config = compute_v1.Allowed()
+    set_protocol_field(allow_config, "tcp")
+    allow_config.ports = ["22"]
+    allow_rule.allowed = [allow_config]
+
+    deny_rule = compute_v1.Firewall()
+    deny_rule.name = rule_names["ssh_deny"]
+    deny_rule.direction = "INGRESS"
+    deny_rule.network = network
+    deny_rule.priority = 200
+    deny_rule.source_ranges = ["0.0.0.0/0"]
+    deny_rule.target_tags = [target_tag]
+    deny_config = compute_v1.Denied()
+    set_protocol_field(deny_config, "tcp")
+    deny_config.ports = ["22"]
+    deny_rule.denied = [deny_config]
+
+    print(f"\n正在将标签 {target_tag} 的 SSH 限制为 {source_cidr} ...")
+    # Install/update deny first. Existing protection remains active while an
+    # allow source is changed; a failed update therefore fails closed.
+    if not upsert_firewall_rule(project_id, deny_rule):
+        return False
+    if upsert_firewall_rule(project_id, allow_rule):
+        return True
+
+    print_warning("SSH 允许规则更新失败；拒绝规则仍保持生效，可能暂时无法登录。")
+    return False
+
+
+def add_deny_cdn_egress(project_id, ip_ranges, instance_info):
     if not ip_ranges:
         print("IP 列表为空，跳过创建拒绝规则。")
-        return
+        return False
 
-    firewall_client = compute_v1.FirewallsClient()
-    rule_name = "deny-cdn-egress-custom"
+    network = instance_info.get("network") or "global/networks/default"
+    rule_name = instance_firewall_rule_names(instance_info)["cdn_deny"]
 
     print(f"\n正在创建出站拒绝规则: {rule_name} ...")
 
@@ -422,36 +517,50 @@ def add_deny_cdn_egress(project_id, ip_ranges, network):
     firewall_rule.network = network
     firewall_rule.priority = 900
     firewall_rule.destination_ranges = ip_ranges
+    firewall_rule.target_tags = [managed_network_tag(instance_info["name"])]
 
     deny_config = compute_v1.Denied()
     set_protocol_field(deny_config, "all")
     firewall_rule.denied = [deny_config]
 
-    try:
-        operation = firewall_client.insert(project=project_id, firewall_resource=firewall_rule)
-        print("正在应用规则...")
-        operation_client = compute_v1.GlobalOperationsClient()
-        operation_client.wait(project=project_id, operation=operation.name)
+    if upsert_firewall_rule(project_id, firewall_rule):
         print_success(f"已添加拒绝规则，共拦截 {len(ip_ranges)} 个 IP 段。")
-    except Exception as e:
-        if "already exists" in str(e):
-            print_warning(f"规则 {rule_name} 已存在。")
-        else:
-            print(f"【失败】{e}")
-            traceback.print_exc()
+        return True
+    return False
 
 
-def configure_firewall(project_id, network):
+def configure_firewall(project_id, instance_info):
+    network = instance_info.get("network") or "global/networks/default"
     print("\n------------------------------------------------")
     print("防火墙规则管理菜单")
     print("------------------------------------------------")
     print(f"目标网络: {network}")
 
-    choice_in = input("\n[1/2] 是否添加【允许所有入站连接 (0.0.0.0/0)】规则? (y/n): ").strip().lower()
-    if choice_in == "y":
-        add_allow_all_ingress(project_id, network)
+    target_tag = managed_network_tag(instance_info["name"])
+    if not remove_legacy_allow_all_rule(project_id, network):
+        print_warning("无法确认旧的全开放规则已移除，已停止防火墙配置。")
+        return False
+
+    if target_tag not in instance_info.get("tags", []):
+        print_warning(
+            f"当前实例没有安全作用域标签 {target_tag}，不会创建可能影响其他实例的入站规则。"
+        )
+        print_warning("请为实例添加该网络标签后重新选择实例，或使用本工具新建实例。")
+        return False
     else:
-        print("已跳过入站规则配置。")
+        choice_in = input("\n[1/2] 是否将 SSH 仅开放给你的 IP/CIDR? (Y/n): ").strip().lower()
+        if choice_in in ("", "y", "yes"):
+            while True:
+                source = input("请输入来源 IP/CIDR（例如 203.0.113.10/32）: ").strip()
+                source_cidr = normalize_source_cidr(source)
+                if source_cidr:
+                    if not add_restricted_ssh_ingress(project_id, instance_info, source_cidr):
+                        print_warning("SSH 限制配置失败。")
+                        return False
+                    break
+                print("输入不是有效的 IPv4 CIDR，请重试。")
+        else:
+            print("已跳过 SSH 入站规则配置。")
 
     choice_out = input("\n[2/2] 是否添加【拒绝对 cdnip.txt 中 IP 的出站连接】规则? (y/n): ").strip().lower()
     if choice_out == "y":
@@ -462,11 +571,14 @@ def configure_firewall(project_id, network):
                 print("脚本将只取前 256 个 IP。")
                 ips = ips[:256]
 
-            add_deny_cdn_egress(project_id, ips, network)
+            if not add_deny_cdn_egress(project_id, ips, instance_info):
+                print_warning("出站拒绝规则配置失败。")
+                return False
     else:
         print("已跳过出站规则配置。")
 
     print("\n所有操作完成。")
+    return True
 
 
 def is_not_found_error(exc):
@@ -479,7 +591,10 @@ def delete_firewall_rule(project_id, rule_name):
     try:
         operation = firewall_client.delete(project=project_id, firewall=rule_name)
         operation_client = compute_v1.GlobalOperationsClient()
-        operation_client.wait(project=project_id, operation=operation.name)
+        completed = operation_client.wait(project=project_id, operation=operation.name)
+        if getattr(completed, "error", None):
+            print_warning(f"删除防火墙规则失败: {rule_name} ({completed.error})")
+            return False
         print_success(f"已删除防火墙规则: {rule_name}")
         return True
     except Exception as e:
@@ -488,6 +603,38 @@ def delete_firewall_rule(project_id, rule_name):
             return True
         print_warning(f"删除防火墙规则失败: {rule_name} ({e})")
         return False
+
+
+def remove_legacy_allow_all_rule(project_id, network):
+    """Delete only the exact unscoped allow-all rule created by upstream."""
+    rule_name = "allow-all-ingress-custom"
+    firewall_client = compute_v1.FirewallsClient()
+    try:
+        rule = firewall_client.get(project=project_id, firewall=rule_name)
+    except Exception as e:
+        if is_not_found_error(e):
+            return True
+        print_warning(f"无法检查旧的全开放规则: {e}")
+        return False
+
+    protocols = {getattr(item, "I_p_protocol", None) for item in rule.allowed}
+    same_network = str(rule.network).split("/")[-1] == str(network).split("/")[-1]
+    is_exact_legacy_rule = (
+        rule.direction == "INGRESS"
+        and same_network
+        and list(rule.source_ranges) == ["0.0.0.0/0"]
+        and not rule.target_tags
+        and not rule.target_service_accounts
+        and rule.priority == 1000
+        and not rule.disabled
+        and protocols == {"all"}
+    )
+    if not is_exact_legacy_rule:
+        print_warning(f"发现同名规则 {rule_name}，但内容不符合已知旧规则；为避免误删已停止。")
+        return False
+
+    print_warning("检测到上游遗留的 VPC 全端口开放规则，正在删除。")
+    return delete_firewall_rule(project_id, rule_name)
 
 
 def delete_disks_if_needed(project_id, zone, disk_names):
@@ -517,7 +664,8 @@ def delete_free_resources(project_id, instance_info):
     print("即将删除以下资源（可以重新创建免费资源）：")
     print(f"- 实例: {instance_name} ({zone})")
     print(f"- 相关磁盘（如仍存在）")
-    print(f"- 防火墙规则: {', '.join(FIREWALL_RULES_TO_CLEAN)}")
+    managed_rules = list(instance_firewall_rule_names(instance_info).values())
+    print(f"- 实例专属防火墙规则: {', '.join(managed_rules)}")
     confirm = input("请输入 DELETE 确认删除: ").strip()
     if confirm != "DELETE":
         print("已取消删除操作。")
@@ -548,11 +696,20 @@ def delete_free_resources(project_id, instance_info):
     delete_disks_if_needed(project_id, zone, disk_names)
 
     print_info("正在清理防火墙规则...")
-    for rule_name in FIREWALL_RULES_TO_CLEAN:
-        delete_firewall_rule(project_id, rule_name)
+    all_ok = True
+    for rule_name in managed_rules:
+        all_ok = delete_firewall_rule(project_id, rule_name) and all_ok
 
-    print_success("清理完成。建议到控制台确认无残留资源。")
-    return True
+    # These legacy names were network-wide. Only remove them through explicit,
+    # content-aware migration rather than blindly when deleting one instance.
+    network = instance_info.get("network") or "global/networks/default"
+    all_ok = remove_legacy_allow_all_rule(project_id, network) and all_ok
+
+    if all_ok:
+        print_success("清理完成。建议到控制台确认无残留资源。")
+    else:
+        print_warning("资源已删除，但部分防火墙清理失败；请到控制台检查。")
+    return all_ok
 
 
 def pick_remote_method():
@@ -577,19 +734,6 @@ def pick_remote_method():
     ssh_port = input("请输入 SSH 端口 (默认 22): ").strip() or "22"
     ssh_key = input("请输入 SSH 私钥路径 (留空表示使用默认密钥): ").strip()
     return {"method": "ssh", "user": ssh_user, "port": ssh_port, "key": ssh_key}
-
-
-def build_remote_download_command(script_url):
-    return (
-        "set -e;"
-        "if command -v curl >/dev/null 2>&1; then DL=\"curl -fsSL\";"
-        "elif command -v wget >/dev/null 2>&1; then DL=\"wget -qO-\";"
-        "else echo \"error: curl or wget not found\"; exit 1; fi;"
-        "tmp=$(mktemp /tmp/gcp_free.XXXXXX.sh);"
-        f"$DL \"{script_url}\" > \"$tmp\";"
-        "sudo bash \"$tmp\";"
-        "rm -f \"$tmp\""
-    )
 
 
 def build_remote_exec_command(project_id, instance_info, remote_config, remote_command):
@@ -629,58 +773,36 @@ def build_remote_exec_command(project_id, instance_info, remote_config, remote_c
     return None
 
 
-def build_remote_upload_command(project_id, instance_info, remote_config, local_path, remote_path):
-    instance_name = instance_info["name"]
-    zone = instance_info["zone"]
-    method = remote_config.get("method")
-
-    if method == "gcloud":
-        return [
-            "gcloud",
-            "compute",
-            "scp",
-            local_path,
-            f"{instance_name}:{remote_path}",
-            "--project",
-            project_id,
-            "--zone",
-            zone,
-        ]
-    if method == "ssh":
-        if shutil.which("scp") is None:
-            print_warning("未找到 scp 命令，无法上传文件。")
-            return None
-        host = instance_info.get("external_ip")
-        if not host or host == "-":
-            print_warning("该实例没有外网 IP，无法使用 SSH 直连。")
-            return None
-        cmd = ["scp"]
-        port = remote_config.get("port")
-        if port:
-            cmd += ["-P", str(port)]
-        key_path = remote_config.get("key")
-        if key_path:
-            cmd += ["-i", key_path]
-        cmd += [local_path, f"{remote_config.get('user')}@{host}:{remote_path}"]
-        return cmd
-
-    print_warning("远程执行方式未设置。")
-    return None
-
-
 def run_remote_script(project_id, instance_info, script_key, remote_config):
-    script_url = REMOTE_SCRIPT_URLS.get(script_key)
-    if not script_url:
+    relative_path = LOCAL_SCRIPT_PATHS.get(script_key)
+    if not relative_path:
         print_warning("未知的脚本类型，无法执行。")
         return False
-    remote_command = build_remote_download_command(script_url)
+
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+    if not os.path.isfile(local_path):
+        print_warning(f"找不到已审计的本地脚本: {local_path}")
+        return False
+
+    with open(local_path, "rb") as script_file:
+        script_bytes = script_file.read()
+    expected_sha256 = hashlib.sha256(script_bytes).hexdigest()
+    remote_command = (
+        "sudo -- bash -c 'set -eu; umask 077; "
+        "tmp=$(mktemp /root/gcp-free-script.XXXXXX); "
+        "trap \"rm -f $tmp\" EXIT; cat >\"$tmp\"; "
+        "actual=$(sha256sum \"$tmp\" | cut -d \" \" -f 1); "
+        f"[ \"$actual\" = \"{expected_sha256}\" ] || "
+        "{ echo checksum-mismatch >&2; exit 1; }; "
+        "bash \"$tmp\"'"
+    )
     cmd = build_remote_exec_command(project_id, instance_info, remote_config, remote_command)
     if not cmd:
         return False
 
-    print_info(f"正在远程执行脚本: {script_url}")
+    print_info(f"正在远程执行本地审计脚本（SHA-256: {expected_sha256}）")
     try:
-        result = subprocess.run(cmd)
+        result = subprocess.run(cmd, input=script_bytes)
         if result.returncode == 0:
             print_success("远程脚本执行完成。")
             return True
@@ -713,35 +835,22 @@ def deploy_dae_config(project_id, instance_info, remote_config):
         print_warning(f"找不到本地配置文件: {local_config}")
         return False
 
-    remote_tmp = "/tmp/config.dae"
-    upload_cmd = build_remote_upload_command(
-        project_id,
-        instance_info,
-        remote_config,
-        local_config,
-        remote_tmp,
-    )
-    if not upload_cmd:
+    with open(local_config, "rb") as config_file:
+        config_bytes = config_file.read()
+    if re.search(rb"\ballow_insecure\s*:\s*true\b", config_bytes, re.IGNORECASE):
+        print_warning("拒绝部署 allow_insecure: true 的 dae 配置。")
         return False
-
-    print_info("正在上传 config.dae ...")
-    try:
-        result = subprocess.run(upload_cmd)
-        if result.returncode != 0:
-            print_warning(f"上传失败，退出码: {result.returncode}")
-            return False
-    except Exception as e:
-        print_warning(f"上传失败: {e}")
-        return False
-
+    expected_sha256 = hashlib.sha256(config_bytes).hexdigest()
     remote_command = (
-        "set -e;"
-        "sudo mkdir -p /usr/local/etc/dae;"
-        "sudo cp /tmp/config.dae /usr/local/etc/dae/config.dae;"
-        "sudo chmod 600 /usr/local/etc/dae/config.dae;"
-        "sudo systemctl enable dae;"
-        "sudo systemctl restart dae;"
-        "rm -f /tmp/config.dae"
+        "sudo -- bash -c 'set -eu; umask 077; install -d -m 0755 /usr/local/etc/dae; "
+        "tmp=$(mktemp /usr/local/etc/dae/.config.XXXXXX); "
+        "trap \"rm -f $tmp\" EXIT; cat >\"$tmp\"; "
+        "actual=$(sha256sum \"$tmp\" | cut -d \" \" -f 1); "
+        f"[ \"$actual\" = \"{expected_sha256}\" ] || "
+        "{ echo checksum-mismatch >&2; exit 1; }; "
+        "chown root:root \"$tmp\"; chmod 0600 \"$tmp\"; "
+        "mv -f \"$tmp\" /usr/local/etc/dae/config.dae; trap - EXIT; "
+        "systemctl enable dae; systemctl restart dae'"
     )
     exec_cmd = build_remote_exec_command(project_id, instance_info, remote_config, remote_command)
     if not exec_cmd:
@@ -749,7 +858,7 @@ def deploy_dae_config(project_id, instance_info, remote_config):
 
     print_info("正在应用配置并重启 dae ...")
     try:
-        result = subprocess.run(exec_cmd)
+        result = subprocess.run(exec_cmd, input=config_bytes)
         if result.returncode == 0:
             print_success("配置已更新并重启 dae。")
             return True
@@ -789,7 +898,28 @@ def main():
         if choice == "1":
             zone = select_zone(project_id)
             os_config = select_os_image()
-            create_instance(project_id, zone, os_config)
+            while True:
+                source = input("请输入允许 SSH 的来源 IP/CIDR（例如 203.0.113.10/32）: ").strip()
+                source_cidr = normalize_source_cidr(source)
+                if source_cidr:
+                    break
+                print("输入不是有效的 IPv4 CIDR，请重试。")
+
+            pending_instance = {
+                "name": "free-tier-vm",
+                "network": "global/networks/default",
+            }
+            if not remove_legacy_allow_all_rule(project_id, pending_instance["network"]):
+                print_warning("无法确认旧的全开放规则已移除，实例未创建。")
+                continue
+            if not add_restricted_ssh_ingress(project_id, pending_instance, source_cidr):
+                print_warning("无法预先建立 SSH 限制规则，实例未创建。")
+                continue
+            if not create_instance(project_id, zone, os_config):
+                print_warning(
+                    "实例创建未确认成功；为避免误删已存在或仍在创建实例的保护，"
+                    "预建防火墙规则会保留。请到控制台确认实例状态。"
+                )
         elif choice == "2":
             current_instance = select_instance(project_id)
         elif choice == "3":
@@ -801,8 +931,7 @@ def main():
             if not current_instance:
                 current_instance = select_instance(project_id)
             if current_instance:
-                network = current_instance.get("network") or "global/networks/default"
-                configure_firewall(project_id, network)
+                configure_firewall(project_id, current_instance)
         elif choice == "5":
             if not current_instance:
                 current_instance = select_instance(project_id)

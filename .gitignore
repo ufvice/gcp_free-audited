@@ -1,3 +1,5 @@
 .ace-tool/
 .venv/
 .gcp_free_initialized
+__pycache__/
+*.py[cod]

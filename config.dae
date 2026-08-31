@@ -3,7 +3,7 @@ global{
     wan_interface: auto
     lan_interface: docker0
     auto_config_kernel_parameter: true
-    allow_insecure: true
+    allow_insecure: false
 }
 dns {
     upstream {
