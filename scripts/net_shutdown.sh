@@ -169,30 +169,34 @@ for attempt in 1 2 3; do
     VNSTAT_ERROR="\$vnstat_output"
     sleep 10
 done
+VNSTAT_RESULT="\$VNSTAT_RAW"
+if [ -z "\$VNSTAT_RESULT" ]; then
+    VNSTAT_RESULT="\$VNSTAT_ERROR"
+fi
+case "\$VNSTAT_RESULT" in
+    *": Not enough data available yet.")
+        init_epoch=""
+        if [ -r "\$INIT_EPOCH_FILE" ]; then
+            init_epoch=\$(cat "\$INIT_EPOCH_FILE" 2>/dev/null || true)
+        fi
+        case "\$init_epoch" in
+            ''|*[!0-9]*)
+                stop_for_limit "vnStat 尚无初始数据且初始化时间无效，为避免失控按失败关闭处理"
+                ;;
+        esac
+        if [ "\${#init_epoch}" -gt 12 ]; then
+            stop_for_limit "vnStat 初始化时间超出有效范围，为避免失控按失败关闭处理"
+        fi
+        now_epoch=\$(date '+%s')
+        if [ "\$now_epoch" -ge "\$init_epoch" ] &&
+           [ \$((now_epoch - init_epoch)) -le "\$INIT_GRACE_SECONDS" ]; then
+            log "vnStat 正在生成首批统计数据；处于安装后 15 分钟初始化窗口，稍后重试。"
+            exit 0
+        fi
+        stop_for_limit "vnStat 在初始化窗口结束后仍无月度数据，为避免失控按失败关闭处理"
+        ;;
+esac
 if [ -z "\$VNSTAT_RAW" ]; then
-    case "\$VNSTAT_ERROR" in
-        *": Not enough data available yet.")
-            init_epoch=""
-            if [ -r "\$INIT_EPOCH_FILE" ]; then
-                init_epoch=\$(cat "\$INIT_EPOCH_FILE" 2>/dev/null || true)
-            fi
-            case "\$init_epoch" in
-                ''|*[!0-9]*)
-                    stop_for_limit "vnStat 尚无初始数据且初始化时间无效，为避免失控按失败关闭处理"
-                    ;;
-            esac
-            if [ "\${#init_epoch}" -gt 12 ]; then
-                stop_for_limit "vnStat 初始化时间超出有效范围，为避免失控按失败关闭处理"
-            fi
-            now_epoch=\$(date '+%s')
-            if [ "\$now_epoch" -ge "\$init_epoch" ] &&
-               [ \$((now_epoch - init_epoch)) -le "\$INIT_GRACE_SECONDS" ]; then
-                log "vnStat 正在生成首批统计数据；处于安装后 15 分钟初始化窗口，稍后重试。"
-                exit 0
-            fi
-            stop_for_limit "vnStat 在初始化窗口结束后仍无月度数据，为避免失控按失败关闭处理"
-            ;;
-    esac
     stop_for_limit "无法读取 vnStat 月度出站计数，为避免失控按失败关闭处理"
 fi
 TX_BYTES=\$(printf '%s\n' "\$VNSTAT_RAW" | awk -F ';' 'NF == 15 { print \$10 }')

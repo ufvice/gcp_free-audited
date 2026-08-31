@@ -42,7 +42,7 @@
 在 Cloud Shell 服务器运行
 ```bash
 # 初次运行；固定到已审计标签，不跟随 main 后续变化
-git clone --branch audited-f09a731-v4 --depth 1 https://github.com/ufvice/gcp_free-audited.git
+git clone --branch audited-f09a731-v5 --depth 1 https://github.com/ufvice/gcp_free-audited.git
 cd gcp_free-audited
 bash start.sh
 # 再次运行
@@ -124,7 +124,7 @@ python gcp.py
 > 监控、vnStat 和关机均可能有延迟；root 入侵者也能停用它。请同时保持最小入站端口、
 > 使用预算告警，并将支付方式风险控制在你可以接受的范围内。
 > 当前实现支持本工具创建的单主网卡 GCP 实例；多网卡或默认路由会变化的机器不在支持范围内。
-> 全新 vnStat 数据库需要数分钟才会产生首批月度数据。v4 会在安装后的 15 分钟内仅对
+> 全新 vnStat 数据库需要数分钟才会产生首批月度数据。v5 会在安装后的 15 分钟内仅对
 > `Not enough data available yet.` 这一明确初始化状态等待重试；窗口结束后仍失败则关机。
 
 ## 常见问题

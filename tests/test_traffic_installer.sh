@@ -35,7 +35,8 @@ cat >"$MOCK_BIN/vnstat" <<'EOF'
 if [[ " $* " == *" --oneline b "* ]]; then
   if [[ -n ${MOCK_VNSTAT_NOT_READY:-} ]]; then
     echo " eth0: Not enough data available yet." >&2
-    exit 1
+    # Debian 12's vnStat 2.10 returns success for this non-data status.
+    exit "${MOCK_VNSTAT_NOT_READY_STATUS:-0}"
   fi
   rx=${MOCK_RX_BYTES:-0}
   tx=${MOCK_TX_BYTES:-1024}
@@ -88,6 +89,14 @@ grep -Fq '@reboot /root/gcp_free_check_traffic.sh # gcp-free-audited' /tmp/insta
 MOCK_VNSTAT_NOT_READY=1 bash /root/gcp_free_check_traffic.sh
 if grep -Fq 'poweroff' /tmp/mock-systemctl.log; then
   echo "fresh vnStat initialization incorrectly triggered shutdown" >&2
+  exit 1
+fi
+
+# Some vnStat versions may return the same explicit state with a nonzero status.
+: >/tmp/mock-systemctl.log
+MOCK_VNSTAT_NOT_READY=1 MOCK_VNSTAT_NOT_READY_STATUS=1 bash /root/gcp_free_check_traffic.sh
+if grep -Fq 'poweroff' /tmp/mock-systemctl.log; then
+  echo "fresh vnStat nonzero initialization state incorrectly triggered shutdown" >&2
   exit 1
 fi
 
